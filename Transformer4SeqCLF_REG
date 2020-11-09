@@ -1,0 +1,161 @@
+import tensorflow as tf
+import tensorflow.keras as keras
+from tensorflow.keras import *
+import numpy as np
+import math
+import copy
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+
+class PositionEncoding(layers.Layer):
+    def __init__(self, var_num, dropout=0.1, max_len=5000, **kwargs):
+        super(PositionEncoding, self).__init__(**kwargs)
+        self.dropout = layers.Dropout(rate=dropout)
+        pe = tf.Variable(tf.zeros(shape=(max_len, var_num)), trainable=False)
+        position = tf.cast(tf.expand_dims(tf.range(0, max_len), axis=1),
+                           dtype=tf.float32)
+        div_term = tf.exp(
+            tf.cast(tf.range(0, var_num, 2), dtype=tf.float32) *
+            -(tf.cast(math.log(10000.0) / var_num, dtype=tf.float32)))
+        pe[:, 0::2].assign(tf.sin(position * div_term))
+        pe[:, 1::2].assign(tf.cos(position * div_term))
+
+        pe = tf.expand_dims(pe, axis=0)
+        self.pe = tf.constant(pe)
+
+    def call(self, x):
+        x = x + self.pe[:, :x.shape[1]]
+        return self.dropout(x)
+
+
+def attention(query, key, value, dropout=None):
+    var_num = query.shape[-1]
+    scaled_scores = tf.matmul(query, tf.transpose(key, perm=[0, 1, 3, 2])) / math.sqrt(var_num)
+    
+    prob_attn = tf.nn.softmax(scaled_scores, axis=-1)
+    
+    return tf.matmul(prob_attn, value), prob_attn
+
+
+def clones(layer, N):
+    lys = [copy.deepcopy(layer) for _ in range(N)]
+    assert all([lys[0].name == lys[i].name for i in range(N)])
+    ori_name = lys[0].name
+    new_name_ls = [ori_name + '_' + str(i) for i in range(N)]
+    for i in range(N):
+        lys[i]._name = new_name_ls[i]
+    return lys
+
+
+class MultiHeadSelfAttention(layers.Layer):
+    def __init__(self, head, var_num, dropout=0.1, **kwargs):
+        super(MultiHeadSelfAttention, self).__init__(**kwargs)
+        assert var_num % head == 0
+        self.head_size = var_num // head
+        self.head = head
+        self.attn = None
+        self.dropout = layers.Dropout(rate=dropout)
+        
+        self.query_ly = layers.Dense(var_num, trainable=True, name='query')
+        self.key_ly = layers.Dense(var_num, trainable=True, name='key')
+        self.value_ly = layers.Dense(var_num, trainable=True, name='value')
+        self.concat_ly = layers.Dense(var_num, trainable=True, name='value')
+        
+        self.layernorm = layers.LayerNormalization(axis=-1, epsilon=1e-6)
+        
+    def call(self, state):
+        batch_size = state.shape[0]
+        
+        query = tf.transpose(tf.reshape(self.query_ly(state), (batch_size, -1, self.head, self.head_size)), perm=[0, 2, 1, 3])
+        key = tf.transpose(tf.reshape(self.key_ly(state), (batch_size, -1, self.head, self.head_size)), perm=[0, 2, 1, 3])
+        value = tf.transpose(tf.reshape(self.value_ly(state), (batch_size, -1, self.head, self.head_size)), perm=[0, 2, 1, 3])
+        
+        x, self.attn = attention(query, key, value, dropout=self.dropout)
+        x = tf.reshape(tf.transpose(x, perm=[0, 2, 1, 3]), shape=(batch_size, -1, self.head * self.head_size))
+        x = self.concat_ly(x)
+        x = self.layernorm(x)
+        
+        return state + self.dropout(x)
+
+
+class FeedForward(layers.Layer):
+    def __init__(self, var_num, d_ff, dropout=0.1, **kwargs):
+        super(FeedForward, self).__init__(*kwargs)
+        self.lin1 = layers.Dense(d_ff, trainable=True)
+        self.lin2 = layers.Dense(var_num, trainable=True)
+        self.dropout = layers.Dropout(rate=dropout)
+        self.layernorm = layers.LayerNormalization(axis=-1, epsilon=1e-6)
+        
+    def call(self, x):
+        ff_res = self.layernorm(self.dropout(self.lin2(self.dropout(tf.nn.relu(self.lin1(x))))))
+        return x + ff_res
+
+
+
+seq_len = x_train.shape[1]
+var_num = x_train.shape[-1]
+batch_size = 64
+head = 8
+d_ff = 64
+dropout = 0.2
+cls_num = 1
+N_enc = 1
+
+attns = clones(MultiHeadSelfAttention(head, var_num, dropout), N_enc)
+ffs = clones(FeedForward(var_num, d_ff, dropout), N_enc)
+pos = PositionEncoding(var_num, dropout)
+
+
+inputs = layers.Input(shape=(seq_len, var_num), batch_size=batch_size)
+x = inputs + pos(inputs)
+for ly in range(N_enc):
+    x = attns[ly](x)
+    x = ffs[ly](x)
+x = layers.GlobalAveragePooling1D()(x)
+x = layers.Dense(d_ff)(x)
+x = layers.Dropout(dropout)(x)
+outputs = layers.Dense(cls_num, activation='sigmoid')(x)
+
+model = keras.Model(inputs=inputs, outputs=outputs)
+
+
+METRICS = [
+      keras.metrics.TruePositives(name='tp'),
+      keras.metrics.FalsePositives(name='fp'),
+      keras.metrics.TrueNegatives(name='tn'),
+      keras.metrics.FalseNegatives(name='fn'), 
+      keras.metrics.BinaryAccuracy(name='accuracy'),
+      keras.metrics.Precision(name='precision'),
+      keras.metrics.Recall(name='recall'),
+      keras.metrics.AUC(name='pr_auc', curve='PR'),
+      keras.metrics.AUC(name='roc_auc', curve='ROC')
+]
+
+
+def plot_metrics(history):
+    metrics2 = ['loss', 'roc_auc', 'accuracy', 'recall']
+    for n, metric in enumerate(metrics2):
+        name = metric.replace("_", " ").capitalize()
+        plt.subplot(2, 2, n + 1)
+        plt.plot(history.epoch,
+                 history.history[metric],
+                 color=colors[0],
+                 label='Train')
+        plt.plot(history.epoch,
+                 history.history['val_' + metric],
+                 color=colors[0],
+                 linestyle="--",
+                 label='Val')
+        plt.xlabel('Epoch')
+        plt.ylabel(name)
+        if metric == 'loss':
+            plt.ylim([0, plt.ylim()[1]])
+        elif metric == 'roc_auc':
+            plt.ylim([0.5, 1])
+        else:
+            plt.ylim([0, 1])
+
+        plt.legend()
+
